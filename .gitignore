@@ -9,8 +9,12 @@
 *.out
 
 # Directories
+.ipynb_checkpoints/
 /recalls
 /re-recalls
 /scratch-recalls
 /scratch-re-recalls
 **/__pycache__/
+checkpoints/
+slurm_outputs/
+pythia*
