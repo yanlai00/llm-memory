@@ -32,13 +32,13 @@ import datasets
 import torch
 import numpy as np
 from datasets import load_dataset
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, SubsetRandomSampler, Subset
 from tqdm.auto import tqdm
 
 import transformers
 from accelerate import Accelerator, DistributedType
 from accelerate.logging import get_logger
-from accelerate.utils import set_seed
+from accelerate.utils import set_seed, DummyOptim
 from transformers import (
     CONFIG_MAPPING,
     MODEL_MAPPING,
@@ -50,7 +50,6 @@ from transformers import (
 from transformers.utils.versions import require_version
 import evaluate
 from torch.nn.parallel import DistributedDataParallel
-
 
 logger = get_logger(__name__)
 
@@ -95,6 +94,10 @@ def parse_args():
     parser.add_argument("--eval_freq", type=int, default=1, help="Number of epochs before every recall experiment.")
     parser.add_argument("--save_freq", type=int, default=10, help="Number of epochs before every moodel and optimizer save.")
 
+    parser.add_argument("--num-grad-steps", type=int, default=1, help="Number of gradient updates for each data point.")
+    parser.add_argument("--num-data-samples", type=int, default=1, help="Number of tasks to interleave.")
+    parser.add_argument("--num-eval-data-samples", type=int, default=100, help="Number of tasks to interleave.")
+
     args = parser.parse_args()
 
     # Sanity checks
@@ -105,8 +108,8 @@ def parse_args():
             extension = args.train_file.split(".")[-1]
             assert extension in ["csv", "json", "txt"], "`train_file` should be a csv, json or txt file."
 
-    assert args.seen_file is not None, "`seen_file` cannot be None, please provide a valid file of seen examples." 
-    assert args.seen_file.split(".")[-1] in ["csv", "json", "txt"], "`seen_file` should be a csv, json or txt file."
+    # assert args.seen_file is not None, "`seen_file` cannot be None, please provide a valid file of seen examples." 
+    # assert args.seen_file.split(".")[-1] in ["csv", "json", "txt"], "`seen_file` should be a csv, json or txt file."
     
     return args
 
@@ -114,6 +117,8 @@ def parse_args():
 def main():
     args = parse_args()
     print(args)
+
+    eval_every_step = True
 
     accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
     
@@ -124,8 +129,8 @@ def main():
     )
     logger.info(accelerator.state, main_process_only=False)
     if accelerator.is_local_main_process:
-        datasets.utils.logging.set_verbosity_warning()
-        transformers.utils.logging.set_verbosity_info()
+        datasets.utils.logging.set_verbosity_error()
+        transformers.utils.logging.set_verbosity_error()
     else:
         datasets.utils.logging.set_verbosity_error()
         transformers.utils.logging.set_verbosity_error()
@@ -148,12 +153,23 @@ def main():
             extension = "text"
             dataset_args["keep_linebreaks"] = not args.no_keep_linebreaks
         raw_datasets = load_dataset(extension, data_files=data_files, **dataset_args)
+    
+    raw_datasets.pop('test')
+    subset_task_index = random.sample(range(len(raw_datasets['train'])), args.num_data_samples)
+    subset_task_index_eval = random.sample(range(len(raw_datasets['validation'])), args.num_eval_data_samples)
+    raw_datasets['train'] = raw_datasets['train'].select(subset_task_index)
+    raw_datasets['validation'] = raw_datasets['validation'].select(subset_task_index_eval)
 
-    eval_files = {"seen": args.seen_file}
-    extension = args.seen_file.split(".")[-1]
-    if extension == "txt":
-        extension = "text"
-    eval_datasets = load_dataset(extension, data_files=eval_files, **dataset_args)
+    if 'validation' in raw_datasets.keys():
+        eval_datasets = raw_datasets
+    else:
+        eval_files = {"train": args.seen_file}
+        dataset_args = {}
+        extension = args.seen_file.split(".")[-1]
+        if extension == "txt":
+            extension = "text"
+            dataset_args["keep_linebreaks"] = not args.no_keep_linebreaks
+        eval_datasets = load_dataset(extension, data_files=eval_files, **dataset_args)
 
 
     # Load pretrained model and tokenizer
@@ -173,6 +189,7 @@ def main():
             tokenizer.pad_token = tokenizer.eos_token
     else:
         raise ValueError()
+    # import pdb; pdb.set_trace()
 
     if args.model_name_or_path and args.use_pretrained_weights:
         if 'pythia' in args.model_name_or_path:
@@ -189,7 +206,7 @@ def main():
     column_names = raw_datasets["train"].column_names
     text_column_name = "text" if "text" in column_names else column_names[0]
 
-    eval_column_names = eval_datasets["seen"].column_names
+    eval_column_names = eval_datasets["train"].column_names
     eval_text_column_name = "text" if "text" in eval_column_names else eval_column_names[0]
 
     if args.block_size is None:
@@ -250,44 +267,74 @@ def main():
             desc=f"Not grouping text.",
         )
 
-    train_dataset = lm_datasets["train"]
-    train_dataloader = DataLoader(train_dataset, shuffle=True, collate_fn=default_data_collator, batch_size=args.per_device_train_batch_size)
+    # For Eval loss Only, Probably not for eval decoding
+    with accelerator.main_process_first():
+        eval_lm_datasets = eval_tokenized_datasets.map(
+            preprocess_function,
+            batched=True,
+            num_proc=args.preprocessing_num_workers,
+            load_from_cache_file=not args.overwrite_cache,
+            desc=f"Not grouping text.",
+        )
 
-    eval_dataset = eval_tokenized_datasets["seen"]
+    train_dataset = lm_datasets["train"]
+    train_dataloader = DataLoader(train_dataset, shuffle=False, collate_fn=default_data_collator, batch_size=args.per_device_train_batch_size)
+
+
+    eval_dataset = eval_lm_datasets["train"]
     eval_dataloader = DataLoader(eval_dataset, shuffle=False, collate_fn=default_data_collator, batch_size=args.per_device_eval_batch_size)
 
-    for index in random.sample(range(len(train_dataset)), 3):
-        logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
-        logger.info(f"Sample {index} of the training set (decoded): {tokenizer.decode(train_dataset[index]['input_ids'], skip_special_tokens=True)}.")
-    for index in random.sample(range(len(eval_dataset)), 3):
-        logger.info(f"Sample {index} of the seen set: {eval_dataset[index]}.")
-        logger.info(f"Sample {index} of the seen set (decoded): {tokenizer.decode(eval_dataset[index]['input_ids'], skip_special_tokens=True)}.")
+    test_dataset = eval_lm_datasets["validation"]
+    test_dataloader = DataLoader(test_dataset, shuffle=False, collate_fn=default_data_collator, batch_size=args.per_device_eval_batch_size)
 
-    model = accelerator.prepare(model)
+
+    for index in random.sample(range(len(train_dataset)), 1):
+        # logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+        logger.info(f"Sample {index} of the training set (decoded): {tokenizer.decode(train_dataset[index]['input_ids'], skip_special_tokens=True)}.")
+    for index in random.sample(range(len(eval_dataset)), 1):
+        # logger.info(f"Sample {index} of the validation set: {eval_dataset[index]}.")
+        logger.info(f"Sample {index} of the validation set (decoded): {tokenizer.decode(eval_dataset[index]['input_ids'], skip_special_tokens=True)}.")
+    # for index in range(len(train_dataset)):
+    #     # logger.info(f"Sample {index} of the training set: {train_dataset[index]}.")
+    #     logger.info(f"Sample {index} of the training set (decoded): {tokenizer.decode(train_dataset[index]['input_ids'], skip_special_tokens=True)}")
+
+    # import pdb; pdb.set_trace()
+    # print(model)
     
     no_decay = ["bias", "layer_norm.weight"]
     optimizer_grouped_parameters = [
         {"params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)], "weight_decay": args.weight_decay},
         {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
     ]
-    optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
+
+    optimizer_cls = (
+        torch.optim.AdamW
+        if accelerator.state.deepspeed_plugin is None
+        or "optimizer" not in accelerator.state.deepspeed_plugin.deepspeed_config
+        else DummyOptim
+    )
+    optimizer = optimizer_cls(optimizer_grouped_parameters, lr=args.learning_rate)
+
+    # optimizer = torch.optim.AdamW(optimizer_grouped_parameters, lr=args.learning_rate)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps) * args.num_grad_steps
     if args.max_train_steps is None:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
         overrode_max_train_steps = True
 
     # Prepare everything with our `accelerator`.
-    optimizer, train_dataloader, eval_dataloader = accelerator.prepare(optimizer, train_dataloader, eval_dataloader)
+    model, optimizer, train_dataloader, eval_dataloader, test_dataloader = accelerator.prepare(model, optimizer, train_dataloader, eval_dataloader, test_dataloader)
+    # print(model)
+    # import sys; sys.exit()
 
     # On TPU, the tie weights in our model have been disconnected, so we need to restore the ties.
     if accelerator.distributed_type == DistributedType.TPU:
         model.tie_weights()
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
-    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+    num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps) * args.num_grad_steps
     if overrode_max_train_steps:
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
 
@@ -345,31 +392,67 @@ def main():
     train_losses = []
     train_losses_all = []
 
+    eval_losses = []
+    eval_losses_all = []
+
+    test_losses = []
+
+    # Initial Eval
+    model.eval()
+    for step, batch in enumerate(eval_dataloader):
+        # import pdb; pdb.set_trace()
+        outputs = model(**batch)
+        loss = outputs.loss
+        eval_losses.append(loss.detach().unsqueeze(0))
+        eval_losses_all.append(loss.detach().unsqueeze(0))
+    eval_losses_ckpt = torch.cat(eval_losses)
+    eval_losses_ckpt = eval_losses_ckpt.cpu().numpy()
+    logger.info(f"Mean eval loss: {np.mean(eval_losses_ckpt)}")
+
+    for step, batch in enumerate(test_dataloader):
+        outputs = model(**batch)
+        loss = outputs.loss
+        test_losses.append(loss.detach().unsqueeze(0))
+    test_losses_ckpt = torch.cat(test_losses)
+    test_losses_ckpt = test_losses_ckpt.cpu().numpy()
+    logger.info(f"Mean TEST loss: {np.mean(test_losses_ckpt)}")
+
+
     for epoch in range(starting_epoch, args.num_train_epochs):
-        model.train()
         for step, batch in enumerate(train_dataloader):
+            model.train()
             # We need to skip steps until we reach the resumed step
-            if args.resume_from_checkpoint and epoch == starting_epoch:
-                if resume_step is not None and step < resume_step:
-                    if step % args.gradient_accumulation_steps == 0:
-                        progress_bar.update(1)
-                        completed_steps += 1
-                    continue
+            for _ in range(args.num_grad_steps):
+                if args.resume_from_checkpoint and epoch == starting_epoch:
+                    if resume_step is not None and step < resume_step:
+                        if step % args.gradient_accumulation_steps == 0:
+                            progress_bar.update(1)
+                            completed_steps += 1
+                        continue
 
-            with accelerator.accumulate(model):
-                outputs = model(**batch)
-                loss = outputs.loss
-                # keep track of the loss at each epoch
-                train_losses.append(loss.detach().unsqueeze(0))
-                train_losses_all.append(loss.detach().unsqueeze(0))
-                accelerator.backward(loss)
-                optimizer.step()
-                optimizer.zero_grad()
+                with accelerator.accumulate(model):
+                    outputs = model(**batch)
+                    loss = outputs.loss
+                    # keep track of the loss at each epoch
+                    train_losses.append(loss.detach().unsqueeze(0))
+                    train_losses_all.append(loss.detach().unsqueeze(0))
+                    accelerator.backward(loss)
+                    optimizer.step()
+                    optimizer.zero_grad()
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                completed_steps += 1
+                # Checks if the accelerator has performed an optimization step behind the scenes
+                if accelerator.sync_gradients:
+                    progress_bar.update(1)
+                    completed_steps += 1
+
+            if eval_every_step:
+                eval_losses = []
+                model.eval()
+                for step, batch in enumerate(eval_dataloader):
+                    outputs = model(**batch)
+                    loss = outputs.loss
+                    eval_losses.append(loss.detach().unsqueeze(0))
+                    eval_losses_all.append(loss.detach().unsqueeze(0))
 
             if isinstance(checkpointing_steps, int):
                 if completed_steps % checkpointing_steps == 0:
@@ -420,49 +503,70 @@ def main():
             np.savez(save_path, train_losses_ckpt=train_losses_ckpt, completed_steps=completed_steps)
 
         if epoch == 0 or (epoch+1) % args.eval_freq == 0:
-            logger.info("***** Running evaluation *****")
-            logger.info(f"Instantaneous batch size per device = {args.per_device_eval_batch_size}")
-            logger.info(f"Seen dataset size = {len(eval_dataset)}")
-            logger.info(f"Seen loader size = {len(eval_dataloader)}")
+            for step, batch in enumerate(test_dataloader):
+                outputs = model(**batch)
+                loss = outputs.loss
+                test_losses.append(loss.detach().unsqueeze(0))
+            test_losses_ckpt = torch.cat(test_losses)
+            test_losses_ckpt = test_losses_ckpt.cpu().numpy()
+            logger.info(f"Mean test loss: {np.mean(test_losses_ckpt)}")
 
-            model.eval()
+            # # Eval Loss
+            # eval_losses = []
+            # model.eval()
+            # for step, batch in enumerate(eval_dataloader):
+            #     outputs = model(**batch)
+            #     loss = outputs.loss
+            #     eval_losses.append(loss.detach().unsqueeze(0))
+            #     eval_losses_all.append(loss.detach().unsqueeze(0))
+            # eval_losses_ckpt = torch.cat(eval_losses)
+            # eval_losses_ckpt = eval_losses_ckpt.cpu().numpy()
+            # logger.info(f"Mean eval loss: {np.mean(eval_losses_ckpt)}")
 
-            # generate completions and evaluate
-            rouge = evaluate.load('rouge')
+        #   # Eval Greedy Decoding
+        #     logger.info("***** Running evaluation *****")
+        #     logger.info(f"Instantaneous batch size per device = {args.per_device_eval_batch_size}")
+        #     logger.info(f"Validation dataset size = {len(eval_dataset)}")
+        #     logger.info(f"Validation loader size = {len(eval_dataloader)}")
 
-            ground_truths = []
-            completions = []
-            prompts = []
-            for _, batch in enumerate(eval_dataloader):
-                with torch.no_grad():
-                    len_input_tok = len(batch['input_ids'][0])
-                    new_batch = {'input_ids': batch['input_ids'][:, :(len_input_tok//2)], 'attention_mask': batch['attention_mask'][:, :(len_input_tok//2)]}
+        #     model.eval()
 
-                    if isinstance(model, DistributedDataParallel):
-                        output_tok = model.module.generate(**new_batch, max_length=len_input_tok, min_length=len_input_tok, return_dict_in_generate=False, output_scores=False)
-                    else:
-                        output_tok = model.generate(**new_batch, max_length=len_input_tok, min_length=len_input_tok, return_dict_in_generate=False, output_scores=False)
-                    output = tokenizer.decode(output_tok[0], skip_special_tokens=True)
-                    input = tokenizer.decode(batch['input_ids'][0], skip_special_tokens=True)
-                    prompt = tokenizer.decode(new_batch['input_ids'][0], skip_special_tokens=True)
+        #     # generate completions and evaluate
+        #     rouge = evaluate.load('rouge')
 
-                    print(input)
-                    print(output)
+        #     ground_truths = []
+        #     completions = []
+        #     prompts = []
+        #     for _, batch in enumerate(eval_dataloader):
+        #         with torch.no_grad():
+        #             len_input_tok = len(batch['input_ids'][0])
+        #             new_batch = {'input_ids': batch['input_ids'][:, :(len_input_tok//2)], 'attention_mask': batch['attention_mask'][:, :(len_input_tok//2)]}
 
-                    ground_truths.append(input)
-                    completions.append(output)
-                    prompts.append(prompt)
+        #             if isinstance(model, DistributedDataParallel):
+        #                 output_tok = model.module.generate(**new_batch, max_length=len_input_tok, min_length=len_input_tok, return_dict_in_generate=False, output_scores=False)
+        #             else:
+        #                 output_tok = model.generate(**new_batch, max_length=len_input_tok, min_length=len_input_tok, return_dict_in_generate=False, output_scores=False)
+        #             output = tokenizer.decode(output_tok[0], skip_special_tokens=True)
+        #             input = tokenizer.decode(batch['input_ids'][0], skip_special_tokens=True)
+        #             prompt = tokenizer.decode(new_batch['input_ids'][0], skip_special_tokens=True)
 
-            results = rouge.compute(predictions=completions, references=ground_truths)
-            print('Rouge results:', results)
+        #             print(input)
+        #             print(output)
 
-            # save results
-            output_dir = f"eval_epoch_{epoch}"
-            if args.output_dir is not None:
-                output_dir = os.path.join(args.output_dir, output_dir)
-            os.makedirs(output_dir, exist_ok=True)
-            save_path = os.path.join(output_dir, args.save_prefix + '_results.npz')
-            np.savez(save_path, ground_truths=ground_truths, completions=completions, prompts=prompts, results=results)
+        #             ground_truths.append(input)
+        #             completions.append(output)
+        #             prompts.append(prompt)
+
+        #     results = rouge.compute(predictions=completions, references=ground_truths)
+        #     print('Rouge results:', results)
+
+        #     # save results
+        #     output_dir = f"eval_epoch_{epoch}"
+        #     if args.output_dir is not None:
+        #         output_dir = os.path.join(args.output_dir, output_dir)
+        #     os.makedirs(output_dir, exist_ok=True)
+        #     save_path = os.path.join(output_dir, args.save_prefix + '_results.npz')
+        #     np.savez(save_path, ground_truths=ground_truths, completions=completions, prompts=prompts, results=results)
 
     if args.output_dir is not None:
         output_dir = os.path.join(args.output_dir, f'final')
@@ -478,9 +582,12 @@ def main():
         train_losses_ckpt = train_losses_ckpt.cpu().numpy()
         logger.info(f"Final mean train loss: {np.mean(train_losses_ckpt)}")
 
+        eval_losses_all_ckpt = torch.cat(eval_losses_all)
+        eval_losses_all_ckpt = eval_losses_all_ckpt.cpu().numpy()
+
         # save results
         save_path = os.path.join(output_dir, args.save_prefix + '_results.npz')
-        np.savez(save_path, train_losses_ckpt=train_losses_ckpt, completed_steps=completed_steps)
+        np.savez(save_path, train_losses_ckpt=train_losses_ckpt, eval_losses_ckpt=eval_losses_all_ckpt, completed_steps=completed_steps)
 
 
 if __name__ == "__main__":

@@ -150,9 +150,11 @@ def main():
         raw_datasets = load_dataset(extension, data_files=data_files, **dataset_args)
 
     eval_files = {"seen": args.seen_file}
+    dataset_args = {}
     extension = args.seen_file.split(".")[-1]
     if extension == "txt":
         extension = "text"
+        dataset_args["keep_linebreaks"] = not args.no_keep_linebreaks
     eval_datasets = load_dataset(extension, data_files=eval_files, **dataset_args)
 
 
